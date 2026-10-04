@@ -1,0 +1,21 @@
+[package]
+name = "rclihdfs"
+version = "0.1.0"
+edition = "2021"
+description = "Policy-enforcing HDFS cp/mv/rm/mkdir wrapper with a Kerberos service-principal switch and Postgres audit log"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/damianm-dev/rclihdfs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+postgres = { version = "0.19", features = ["with-chrono-0_4"] }
+regex = "1"
+chrono = "0.4"
+dotenvy = "0.15"
+log = "0.4"
+env_logger = "0.11"
+libc = "0.2"
+colored = "2"
+dialoguer = "0.11"
+indicatif = "0.17"
+ctrlc = { version = "3", features = ["termination"] }
