@@ -1,5 +1,7 @@
 # rclihdfs
 
+[![CI](https://github.com/damianm-dev/rclihdfs/actions/workflows/ci.yml/badge.svg)](https://github.com/damianm-dev/rclihdfs/actions/workflows/ci.yml)
+
 A small CLI that wraps `hdfs dfs` for `cp`, `mv`, `rm` and `mkdir` and enforces
 a fixed path policy. Operations on privileged roots run as a Kerberos service
 principal from a keytab, in a separate credential cache; everything else runs
