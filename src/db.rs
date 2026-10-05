@@ -3,22 +3,21 @@ use regex::Regex;
 
 use crate::error::CliError;
 
-/// Writes an operation audit record to Postgres.
-pub fn log_to_db(
-    username: &str,
-    mode: &str,
-    source: &str,
-    target: &str,
-    dt: NaiveDateTime,
-) -> Result<(), CliError> {
+/// Reads and validates `DB.TABLE`. Rejected early because it is interpolated
+/// into the SQL, so it cannot be bound as a parameter.
+fn audit_table() -> Result<String, CliError> {
     let table = std::env::var("DB.TABLE").unwrap_or_default();
     let table_re = Regex::new(r"^[a-zA-Z0-9_.]+$").unwrap();
     if !table_re.is_match(&table) {
-        return Err(CliError::Policy(format!(
+        return Err(CliError::Runtime(format!(
             "Unsafe DB.TABLE value: {table:?}"
         )));
     }
+    Ok(table)
+}
 
+/// Opens a connection to the audit database from the `DB.*` settings.
+fn connect() -> Result<postgres::Client, CliError> {
     let user = std::env::var("DB.USER").unwrap_or_default();
     let password = std::env::var("DB.PASSWORD").unwrap_or_default();
     let host = std::env::var("DB.HOST").unwrap_or_default();
@@ -28,15 +27,57 @@ pub fn log_to_db(
     let conn_str =
         format!("user={user} password={password} host={host} port={port} dbname={dbname}");
 
-    let mut client = postgres::Client::connect(&conn_str, postgres::NoTls)
-        .map_err(|e| CliError::Runtime(format!("failed to connect to db: {e}")))?;
+    postgres::Client::connect(&conn_str, postgres::NoTls)
+        .map_err(|e| CliError::Runtime(format!("failed to connect to db: {e}")))
+}
 
-    let query = format!(
-        "INSERT INTO {table}(username, mode, source, target, date) VALUES ($1,$2,$3,$4,$5)"
-    );
-    client
-        .execute(&query, &[&username, &mode, &source, &target, &dt])
-        .map_err(|e| CliError::Runtime(format!("failed to insert audit record: {e}")))?;
+/// A single audit-database connection, reused for every record written by one
+/// command run.
+pub struct AuditLog {
+    client: postgres::Client,
+    table: String,
+}
 
-    Ok(())
+impl AuditLog {
+    /// Validates the config and opens the connection. Called before any HDFS
+    /// change is made, so it doubles as the health check: if the database is
+    /// misconfigured or unreachable, the command aborts before touching HDFS.
+    pub fn open() -> Result<Self, CliError> {
+        let table = audit_table()?;
+        let client = connect()?;
+        Ok(Self { client, table })
+    }
+
+    /// Writes one audit record, reusing the connection.
+    pub fn insert(
+        &mut self,
+        username: &str,
+        mode: &str,
+        source: &str,
+        target: &str,
+        dt: NaiveDateTime,
+    ) -> Result<(), CliError> {
+        let query = format!(
+            "INSERT INTO {}(username, mode, source, target, date) VALUES ($1,$2,$3,$4,$5)",
+            self.table
+        );
+        self.client
+            .execute(&query, &[&username, &mode, &source, &target, &dt])
+            .map_err(|e| CliError::Runtime(format!("failed to insert audit record: {e}")))?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_unsafe_table() {
+        std::env::set_var("DB.TABLE", "audit; DROP TABLE x");
+        assert!(matches!(audit_table(), Err(CliError::Runtime(_))));
+        std::env::set_var("DB.TABLE", "public.hdfs_audit");
+        assert_eq!(audit_table().unwrap(), "public.hdfs_audit");
+        std::env::remove_var("DB.TABLE");
+    }
 }

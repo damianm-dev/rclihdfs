@@ -13,12 +13,17 @@ pub struct AuthConfig {
     pub tech_ccache: String,
 }
 
-/// Loads `/etc/clihdfs/conf` into the process environment, if present
-/// (silently does nothing when the file cannot be found). File values
-/// override the caller's environment, so a user cannot redefine the policy
-/// roots or principal with e.g. `HDFS_PROD_ROOT=... rclihdfs`.
-pub fn load_conf() {
-    let _ = dotenvy::from_path_override(CONF_PATH);
+/// Loads `/etc/clihdfs/conf` into the process environment; fails if the file
+/// is missing, unreadable or malformed. File values override the caller's
+/// environment, so a user cannot redefine the policy roots or principal with
+/// e.g. `HDFS_PROD_ROOT=... rclihdfs`.
+pub fn load_conf() -> Result<(), CliError> {
+    load_conf_from(CONF_PATH)
+}
+
+fn load_conf_from(path: &str) -> Result<(), CliError> {
+    dotenvy::from_path_override(path)
+        .map_err(|e| CliError::Runtime(format!("cannot load config {path}: {e}")))
 }
 
 impl AuthConfig {
@@ -112,6 +117,27 @@ mod tests {
         assert_eq!(cfg.tech_user(), "svc");
         cfg.tech_principal = "svc/host.example.com@EXAMPLE.COM".to_string();
         assert_eq!(cfg.tech_user(), "svc");
+    }
+
+    #[test]
+    fn load_conf_requires_a_valid_file() {
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+
+        let missing = dir.join(format!("rclihdfs_conf_missing_{pid}"));
+        assert!(load_conf_from(missing.to_str().unwrap()).is_err());
+
+        let bad = dir.join(format!("rclihdfs_conf_bad_{pid}"));
+        std::fs::write(&bad, "RCLIHDFS_TEST_BAD='unterminated\n").unwrap();
+        assert!(load_conf_from(bad.to_str().unwrap()).is_err());
+        let _ = std::fs::remove_file(&bad);
+
+        let good = dir.join(format!("rclihdfs_conf_good_{pid}"));
+        std::fs::write(&good, "RCLIHDFS_TEST_KEY=from_file\n").unwrap();
+        std::env::set_var("RCLIHDFS_TEST_KEY", "from_env");
+        load_conf_from(good.to_str().unwrap()).unwrap();
+        assert_eq!(std::env::var("RCLIHDFS_TEST_KEY").unwrap(), "from_file");
+        let _ = std::fs::remove_file(&good);
     }
 
     #[test]

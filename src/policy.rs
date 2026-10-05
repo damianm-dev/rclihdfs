@@ -29,7 +29,7 @@ fn starts_under(path: &str, root: &str) -> bool {
 }
 
 /// `path` is `root` itself or inside it.
-fn is_under(path: &str, root: &str) -> bool {
+pub(crate) fn is_under(path: &str, root: &str) -> bool {
     let path = norm_path(path);
     path == root || starts_under(&path, root)
 }
@@ -179,6 +179,13 @@ pub fn has_wildcard(path: &str) -> bool {
     path.contains(['*', '?', '['])
 }
 
+/// A path has a `.` or `..` component. HDFS resolves these (e.g.
+/// `/bigdata/../user/x` -> `/user/x`), so they would slip past the
+/// prefix-based policy checks and must be rejected before any check runs.
+pub fn has_traversal(path: &str) -> bool {
+    path.split('/').any(|seg| seg == "." || seg == "..")
+}
+
 #[cfg(test)]
 pub(crate) fn sample_layout() -> Layout {
     Layout {
@@ -229,6 +236,18 @@ mod tests {
         assert!(l.requires_tech_auth_for_mv(&["/compute/x"]));
         assert!(l.requires_tech_auth_for_mv(&["/science/x"]));
         assert!(!l.requires_tech_auth_for_mv(&["/user/u/a"]));
+    }
+
+    #[test]
+    fn traversal_detection() {
+        assert!(has_traversal("/bigdata/../user/x"));
+        assert!(has_traversal("/bigdata/./temp/x"));
+        assert!(has_traversal(".."));
+        assert!(has_traversal("/a/.."));
+        assert!(!has_traversal("/bigdata/temp/x"));
+        // only exact '.'/'..' segments, not substrings
+        assert!(!has_traversal("/bigdata/..foo/a.b"));
+        assert!(!has_traversal("/bigdata/temp/*"));
     }
 
     #[test]

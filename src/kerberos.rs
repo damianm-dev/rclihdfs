@@ -61,3 +61,21 @@ impl Drop for KerberosContext {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enter_without_tech_leaves_kerberos_untouched() {
+        let cfg = AuthConfig {
+            tech_principal: "svc@EXAMPLE.COM".to_string(),
+            tech_keytab: String::new(),
+            tech_ccache: "FILE:/tmp/unused".to_string(),
+        };
+        // No tech auth: no klist/kinit is run, env is None, and drop does not
+        // kdestroy (nothing to clean up).
+        let ctx = KerberosContext::enter(false, &cfg).unwrap();
+        assert!(ctx.env().is_none());
+    }
+}

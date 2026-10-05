@@ -5,8 +5,8 @@
 A small CLI that wraps `hdfs dfs` for `cp`, `mv`, `rm` and `mkdir` and enforces
 a fixed path policy. Operations on privileged roots run as a Kerberos service
 principal from a keytab, in a separate credential cache; everything else runs
-with the caller's own Kerberos ticket. Every successful operation is written to
-a Postgres audit table.
+with the caller's own Kerberos ticket. Every object that is copied, moved,
+removed or created is written to a Postgres audit table.
 
 ## Requirements
 
@@ -39,20 +39,21 @@ rclihdfs rm    <source> [-y|--yes]
 rclihdfs mkdir <path>
 ```
 
-- `mv` and `rm` ask for confirmation. Non-interactive callers must pass `-y`.
+- `mv` and `rm` ask for confirmation. `-y` skips the prompt.
 - `cp` and `mv` accept a wildcard (`*`, `?`, `[`) in the source. The target
   must then be an existing directory. Wildcards in the target are rejected.
 - `rm` does not delete: it moves the path to a trash location (see below).
-- Multi-object operations show a progress bar when stderr is a terminal.
+- A wildcard `mv` or `cp` handles all matches with a single `hdfs dfs` call.
 
 Exit codes: `0` success, `1` policy violation, declined confirmation or
 missing path, `2` any other error.
 
 ## Configuration
 
-Settings are read from `/etc/clihdfs/conf` (dotenv format). Values in the file
-override environment variables of the same name; keys missing from the file
-(or the whole file) fall back to the environment. All keys are required.
+Settings are read from `/etc/clihdfs/conf` (dotenv format). The command fails
+with exit code `2` if the file is missing, unreadable or malformed. Values in
+the file override environment variables of the same name; keys missing from
+the file fall back to the environment. All keys are required.
 
 ```sh
 # Kerberos service principal used for privileged roots
@@ -90,6 +91,8 @@ The caller is identified by the real uid (from the passwd database), not by
 | `TO_STAGING_ROOT` | `STAGING_ROOT` | `STAGING_ROOT` |
 | `<home>/…` | `<home>/…`, `STAGING_ROOT` | `<home>/…`, `STAGING_ROOT` |
 
+- Paths with a `.` or `..` component are rejected, since HDFS would resolve
+  them and move the real target outside the policy.
 - `mkdir` and `rm` only accept paths under `PROD_ROOT/`, `EXTERNAL_ROOT/` or
   `<home>/`.
 - `rm` moves the path to `<home>/.trash<path>` for home paths, or to
@@ -103,15 +106,24 @@ The caller is identified by the real uid (from the passwd database), not by
 
 ## Audit log
 
-After each successful operation, one row per affected object is inserted:
+After each operation, one row per affected object is inserted:
 
 ```sql
 INSERT INTO <DB.TABLE>(username, mode, source, target, date) VALUES (...)
 ```
 
 `mode` is `cp`, `mv`, `rm` or `mkdir`; `date` is local time without a time
-zone. The operation fails with exit code `2` if the insert fails. The HDFS
-change has already been made at that point.
+zone.
+
+The audit database connection is opened before the HDFS change is made: if it
+is misconfigured or unreachable, the command aborts with exit code `2` and
+nothing is changed. That same connection is reused for every record. If a
+record still cannot be written (e.g. the database drops mid-run), the command
+fails with exit code `2` — the HDFS change has already been made, so an
+incomplete audit is surfaced, not hidden.
+
+If a wildcard `cp` or `mv` partly fails, rows are written only for the objects
+it actually copied or moved, and the command exits with code `2`.
 
 ## Security note
 

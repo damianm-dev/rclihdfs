@@ -12,19 +12,18 @@ use clap::{CommandFactory, Parser};
 use error::CliError;
 
 fn run() -> Result<(), CliError> {
-    config::load_conf();
-
     if std::env::args().len() == 1 {
         cli::Cli::command().print_help().ok();
         eprintln!();
         std::process::exit(1);
     }
 
+    let args = cli::Cli::parse();
+
+    config::load_conf()?;
     let user = config::current_username()?;
     let cfg = config::build_auth_config()?;
     let layout = config::build_layout()?;
-
-    let args = cli::Cli::parse();
 
     match args.command {
         cli::Command::Cp { source, target } => {

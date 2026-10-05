@@ -2,19 +2,32 @@ use chrono::Local;
 use colored::Colorize;
 
 use crate::config::AuthConfig;
-use crate::db::log_to_db;
+use crate::db::AuditLog;
 use crate::error::CliError;
 use crate::hdfs;
 use crate::kerberos::KerberosContext;
-use crate::policy::{has_wildcard, norm_path, Layout};
+use crate::policy::{has_traversal, has_wildcard, norm_path, Layout};
+use crate::proc::Env;
 
 fn log_success() {
     log::info!("{}", "SUCCESS".green().bold());
 }
 
+/// Rejects any path with a `.` or `..` component before policy checks run;
+/// HDFS would resolve it and move the real target outside the policy.
+fn reject_traversal(paths: &[&str]) -> Result<(), CliError> {
+    for p in paths {
+        if has_traversal(p) {
+            return Err(CliError::Policy(format!(
+                "path must not contain '.' or '..' segments: {p}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Prompts the user with `prompt (y/N)` and requires an explicit yes to
-/// proceed. Skipped entirely when `yes` is true (the `-y`/`--yes` flag),
-/// which is what non-interactive/automated callers (e.g. Airflow) must pass.
+/// proceed. Skipped entirely when `yes` is true (the `-y`/`--yes` flag).
 fn confirm(prompt: &str, yes: bool) -> Result<(), CliError> {
     if yes {
         return Ok(());
@@ -33,6 +46,23 @@ fn confirm(prompt: &str, yes: bool) -> Result<(), CliError> {
     }
 }
 
+/// A wildcard source needs an existing directory as target. Checks `-d`
+/// first, so a valid target costs one `hdfs` call; `-e` only runs to pick
+/// the error.
+fn ensure_target_dir(target: &str, env: Option<&Env>) -> Result<(), CliError> {
+    if hdfs::is_dir(target, env)? {
+        return Ok(());
+    }
+    if !hdfs::exists(target, env)? {
+        return Err(CliError::NotFound(format!(
+            "target path does not exist: {target}"
+        )));
+    }
+    Err(CliError::Policy(
+        "target must be an existing directory when source contains wildcard".to_string(),
+    ))
+}
+
 pub fn do_cp(
     source: &str,
     target: &str,
@@ -42,6 +72,7 @@ pub fn do_cp(
 ) -> Result<(), CliError> {
     let raw_source = source;
     let raw_target = target;
+    reject_traversal(&[raw_source, raw_target])?;
     let target = norm_path(raw_target);
 
     if has_wildcard(raw_target) {
@@ -65,6 +96,7 @@ pub fn do_cp(
     let use_tech = layout.requires_tech_auth(&[&source_for_policy, &target])
         || layout.is_to_staging(&source_for_policy);
 
+    let mut audit_log = AuditLog::open()?;
     let ctx = KerberosContext::enter(use_tech, cfg)?;
     let env = ctx.env();
 
@@ -76,37 +108,39 @@ pub fn do_cp(
             )));
         }
 
-        if !hdfs::exists(&target, env) {
-            return Err(CliError::NotFound(format!(
-                "target path does not exist: {target}"
-            )));
-        }
-        if !hdfs::is_dir(&target, env) {
-            return Err(CliError::Policy(
-                "target must be an existing directory when source contains wildcard".to_string(),
-            ));
-        }
+        ensure_target_dir(&target, env)?;
 
-        hdfs::cp_many(&matches, &target, env)?;
+        // On partial failure, only destinations that appeared were copied.
+        let dests = hdfs::dest_paths(&matches, &target);
+        let before = hdfs::existing(&dests, env)?;
+        let result = hdfs::cp_many(&matches, &target, env);
+        let copied: Vec<&String> = match result {
+            Ok(()) => matches.iter().collect(),
+            Err(_) => {
+                let after = hdfs::existing(&dests, env)?;
+                hdfs::newly_present(&matches, &dests, &before, &after)
+            }
+        };
 
         let now = Local::now().naive_local();
-        for matched in &matches {
-            log_to_db(user, "cp", matched, &target, now)?;
+        for matched in copied {
+            audit_log.insert(user, "cp", matched, &target, now)?;
         }
+        result?;
 
         log_success();
         return Ok(());
     }
 
     let source = norm_path(raw_source);
-    if !hdfs::exists(&source, env) {
+    if !hdfs::exists(&source, env)? {
         return Err(CliError::NotFound(format!(
             "source path does not exist: {source}"
         )));
     }
 
     hdfs::cp(&source, &target, env)?;
-    log_to_db(user, "cp", &source, &target, Local::now().naive_local())?;
+    audit_log.insert(user, "cp", &source, &target, Local::now().naive_local())?;
     log_success();
     Ok(())
 }
@@ -121,6 +155,7 @@ pub fn do_mv(
 ) -> Result<(), CliError> {
     let raw_source = source;
     let raw_target = target;
+    reject_traversal(&[raw_source, raw_target])?;
     let target = norm_path(raw_target);
 
     if has_wildcard(raw_target) {
@@ -143,6 +178,7 @@ pub fn do_mv(
 
     let use_tech = layout.requires_tech_auth_for_mv(&[&source_for_policy, &target]);
 
+    let mut audit_log = AuditLog::open()?;
     let ctx = KerberosContext::enter(use_tech, cfg)?;
     let env = ctx.env();
 
@@ -154,20 +190,9 @@ pub fn do_mv(
             )));
         }
 
-        if !hdfs::exists(&target, env) {
-            return Err(CliError::NotFound(format!(
-                "target path does not exist: {target}"
-            )));
-        }
-        if !hdfs::is_dir(&target, env) {
-            return Err(CliError::Policy(
-                "target must be an existing directory when source contains wildcard".to_string(),
-            ));
-        }
+        ensure_target_dir(&target, env)?;
 
-        for matched in &matches {
-            hdfs::ensure_min_replication_for_staging_to_prod(matched, &target, env, layout, 3)?;
-        }
+        hdfs::ensure_min_replication_for_staging_to_prod(&matches, &target, env, layout, 3)?;
 
         confirm(
             &format!(
@@ -177,14 +202,23 @@ pub fn do_mv(
             yes,
         )?;
 
-        if let Err(e) = hdfs::mv_many(&matches, &target, env) {
-            layout.print_user_to_staging_acl_hint(raw_source, &target, user, cfg.tech_user());
-            return Err(e);
-        }
+        // On partial failure, only sources that are gone were moved.
+        let result = hdfs::mv_many(&matches, &target, env);
+        let moved: Vec<&String> = match result {
+            Ok(()) => matches.iter().collect(),
+            Err(_) => {
+                let left = hdfs::existing(&matches, env)?;
+                matches.iter().filter(|m| !left.contains(*m)).collect()
+            }
+        };
 
         let now = Local::now().naive_local();
-        for matched in &matches {
-            log_to_db(user, "mv", matched, &target, now)?;
+        for matched in moved {
+            audit_log.insert(user, "mv", matched, &target, now)?;
+        }
+        if let Err(e) = result {
+            layout.print_user_to_staging_acl_hint(raw_source, &target, user, cfg.tech_user());
+            return Err(e);
         }
 
         log_success();
@@ -192,13 +226,19 @@ pub fn do_mv(
     }
 
     let source = norm_path(raw_source);
-    if !hdfs::exists(&source, env) {
+    if !hdfs::exists(&source, env)? {
         return Err(CliError::NotFound(format!(
             "source path does not exist: {source}"
         )));
     }
 
-    hdfs::ensure_min_replication_for_staging_to_prod(&source, &target, env, layout, 3)?;
+    hdfs::ensure_min_replication_for_staging_to_prod(
+        std::slice::from_ref(&source),
+        &target,
+        env,
+        layout,
+        3,
+    )?;
 
     confirm(&format!("Move '{source}' -> '{target}'?"), yes)?;
 
@@ -207,12 +247,13 @@ pub fn do_mv(
         return Err(e);
     }
 
-    log_to_db(user, "mv", &source, &target, Local::now().naive_local())?;
+    audit_log.insert(user, "mv", &source, &target, Local::now().naive_local())?;
     log_success();
     Ok(())
 }
 
 pub fn do_mkdir(path: &str, user: &str, cfg: &AuthConfig, layout: &Layout) -> Result<(), CliError> {
+    reject_traversal(&[path])?;
     let path = norm_path(path);
 
     if !layout.is_allowed_root(&path, user) {
@@ -220,11 +261,12 @@ pub fn do_mkdir(path: &str, user: &str, cfg: &AuthConfig, layout: &Layout) -> Re
     }
 
     let use_tech = layout.requires_tech_auth(&[&path]);
+    let mut audit_log = AuditLog::open()?;
     let ctx = KerberosContext::enter(use_tech, cfg)?;
     let env = ctx.env();
 
     hdfs::mkdir_p(&path, env)?;
-    log_to_db(user, "mkdir", &path, &path, Local::now().naive_local())?;
+    audit_log.insert(user, "mkdir", &path, &path, Local::now().naive_local())?;
     log_success();
     Ok(())
 }
@@ -236,6 +278,7 @@ pub fn do_rm(
     cfg: &AuthConfig,
     layout: &Layout,
 ) -> Result<(), CliError> {
+    reject_traversal(&[source])?;
     let source = norm_path(source);
 
     if !layout.is_allowed_root(&source, user) {
@@ -250,10 +293,11 @@ pub fn do_rm(
         if use_tech { "tech" } else { "user" }
     );
 
+    let mut audit_log = AuditLog::open()?;
     let ctx = KerberosContext::enter(use_tech, cfg)?;
     let env = ctx.env();
 
-    if !hdfs::exists(&source, env) {
+    if !hdfs::exists(&source, env)? {
         return Err(CliError::NotFound(format!(
             "source path does not exist: {source}"
         )));
@@ -267,7 +311,7 @@ pub fn do_rm(
         .unwrap_or_default();
     hdfs::mkdir_p(&parent, env)?;
 
-    if hdfs::exists(&target, env) {
+    if hdfs::exists(&target, env)? {
         log::warn!("Trash collision, removing existing: {target}");
         hdfs::rm_rf(&target, env);
     }
@@ -275,7 +319,38 @@ pub fn do_rm(
     hdfs::mv(&source, &parent, env)?;
 
     log::info!("{}", format!("MOVED TO TRASH: {target}").cyan());
-    log_to_db(user, "rm", &source, &target, Local::now().naive_local())?;
+    audit_log.insert(user, "rm", &source, &target, Local::now().naive_local())?;
     log_success();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reject_traversal_catches_dot_segments() {
+        assert!(reject_traversal(&["/data/x", "/data/y"]).is_ok());
+        assert!(matches!(
+            reject_traversal(&["/data/../user/x"]),
+            Err(CliError::Policy(_))
+        ));
+        assert!(matches!(
+            reject_traversal(&["/data/./x"]),
+            Err(CliError::Policy(_))
+        ));
+        // a bad path anywhere in the list is caught
+        assert!(matches!(
+            reject_traversal(&["/data/x", "/data/.."]),
+            Err(CliError::Policy(_))
+        ));
+        // substrings of '.'/'..' are not components
+        assert!(reject_traversal(&["/data/..foo/a.b"]).is_ok());
+    }
+
+    #[test]
+    fn confirm_with_yes_skips_prompt() {
+        // `yes` short-circuits before any stdin interaction.
+        assert!(confirm("ignored", true).is_ok());
+    }
 }
